@@ -41,7 +41,6 @@ import org.apache.parquet.bytes.BytesInput;
 import org.apache.parquet.compression.CompressionCodecFactory;
 import org.apache.parquet.conf.HadoopParquetConfiguration;
 import org.apache.parquet.conf.ParquetConfiguration;
-import org.apache.parquet.hadoop.codec.Lz4RawCodec;
 import org.apache.parquet.hadoop.codec.ZstandardCodec;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
 import org.apache.parquet.hadoop.util.ConfigurationUtil;
@@ -167,6 +166,12 @@ public class CodecFactory implements CompressionCodecFactory {
     private final CompressionCodec codec;
     private final Decompressor decompressor;
 
+    // Reused across pages so we do not allocate a decompression buffer (nor a DecompressorStream and
+    // its internal buffer) per page. Per the CompressionCodecFactory#decompress contract, the returned
+    // BytesInput is backed by this buffer and must be consumed before this decompressor is used again;
+    // callers that retain the bytes (e.g. dictionary pages) must copy the result.
+    private byte[] outputBuffer = new byte[0];
+
     HeapBytesDecompressor(CompressionCodec codec) {
       this.codec = Objects.requireNonNull(codec);
       decompressor = CodecPool.getDecompressor(codec);
@@ -174,24 +179,31 @@ public class CodecFactory implements CompressionCodecFactory {
 
     @Override
     public BytesInput decompress(BytesInput bytes, int decompressedSize) throws IOException {
-      final BytesInput decompressed;
-      if (decompressor != null) {
-        decompressor.reset();
+      if (decompressor == null) {
+        // Some codecs do not provide a reusable Decompressor; fall back to the stream API and
+        // eagerly materialize the result so it is independent of the (closed) input stream.
+        try (InputStream is = codec.createInputStream(bytes.toInputStream(), null)) {
+          return BytesInput.copy(BytesInput.from(is, decompressedSize));
+        }
       }
-      InputStream is = codec.createInputStream(bytes.toInputStream(), decompressor);
 
-      // Eagerly materialize the decompressed stream for codecs that require all input in a single buffer.
-      // ZSTD: releases off-heap resources early to avoid fragmentation (see parquet-format#398).
-      // LZ4_RAW: requires one-shot decompression; the lazy StreamBytesInput.writeInto() path reads via
-      // Channels.newChannel() in ~8KB chunks, causing the decompressor to be called with an undersized
-      // output buffer (see #3478).
-      if (codec instanceof ZstandardCodec || codec instanceof Lz4RawCodec) {
-        decompressed = BytesInput.copy(BytesInput.from(is, decompressedSize));
-        is.close();
-      } else {
-        decompressed = BytesInput.from(is, decompressedSize);
+      // One-shot decompression into a reused buffer, avoiding a per-page DecompressorStream. This
+      // also feeds the whole output buffer at once, which ZSTD and LZ4_RAW require (see #3478).
+      decompressor.reset();
+      byte[] input = bytes.toByteArray();
+      decompressor.setInput(input, 0, input.length);
+      if (outputBuffer.length < decompressedSize) {
+        outputBuffer = new byte[decompressedSize];
       }
-      return decompressed;
+      int offset = 0;
+      while (offset < decompressedSize) {
+        int count = decompressor.decompress(outputBuffer, offset, decompressedSize - offset);
+        if (count == 0) {
+          break;
+        }
+        offset += count;
+      }
+      return BytesInput.from(outputBuffer, 0, decompressedSize);
     }
 
     @Override

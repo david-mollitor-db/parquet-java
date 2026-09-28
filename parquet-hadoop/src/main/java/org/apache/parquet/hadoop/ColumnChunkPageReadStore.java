@@ -325,8 +325,12 @@ class ColumnChunkPageReadStore implements PageReadStore, DictionaryPageReadStore
         }
         long start = System.nanoTime();
         setDecompressMetrics(bytes, start);
+        // Copy the decompressed dictionary: unlike data pages (consumed immediately), the dictionary
+        // is retained for the lifetime of the column reader (e.g. Binary dictionary entries reference
+        // these bytes), so it must not alias a decompressor's reused output buffer.
         DictionaryPage decompressedPage = new DictionaryPage(
-            decompressor.decompress(bytes, compressedDictionaryPage.getUncompressedSize()),
+            BytesInput.copy(
+                decompressor.decompress(bytes, compressedDictionaryPage.getUncompressedSize())),
             compressedDictionaryPage.getDictionarySize(),
             compressedDictionaryPage.getEncoding());
         if (compressedDictionaryPage.getCrc().isPresent()) {
